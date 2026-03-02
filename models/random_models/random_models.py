@@ -120,5 +120,3 @@ class RandomVideoMAEV1L(VideoMAE):
         reinitialize_model(model)
 
         return model
-
-

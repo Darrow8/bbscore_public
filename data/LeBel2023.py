@@ -1,5 +1,6 @@
 import os
 import glob
+import logging
 import numpy as np
 import h5py
 import re
@@ -7,6 +8,8 @@ import soundfile as sf
 from collections import defaultdict
 from typing import Optional, List, Union, Callable, Dict, Tuple
 from data.base import BaseDataset
+
+logger = logging.getLogger(__name__)
 
 
 class LeBel2023StimulusSet(BaseDataset):
@@ -810,3 +813,335 @@ class LeBel2023AudioTRStimulusSet(BaseDataset):
 
     def __getitem__(self, idx):
         return self._load_audio(self.audio_paths[idx])
+
+
+# ---------------------------------------------------------------------------
+# Desikan-Killiany region definitions
+# ---------------------------------------------------------------------------
+
+LANGUAGE_REGIONS = {
+    'superiortemporal',
+    'middletemporal',
+    'parsopercularis',
+    'parstriangularis',
+    'supramarginal',
+    'inferiorparietal',
+    'bankssts',
+    'temporalpole',
+    'fusiform',
+    'transversetemporal',
+}
+
+REGION_GROUPS = {
+    'temporal': [
+        'superiortemporal', 'middletemporal', 'inferiortemporal',
+        'bankssts', 'transversetemporal', 'temporalpole',
+        'fusiform', 'entorhinal', 'parahippocampal',
+    ],
+    'frontal': [
+        'parsopercularis', 'parstriangularis', 'parsorbitalis',
+        'rostralmiddlefrontal', 'caudalmiddlefrontal', 'superiorfrontal',
+        'lateralorbitofrontal', 'medialorbitofrontal', 'frontalpole',
+        'precentral', 'paracentral',
+    ],
+    'parietal': [
+        'supramarginal', 'inferiorparietal', 'superiorparietal',
+        'postcentral', 'precuneus',
+    ],
+    'occipital': [
+        'lateraloccipital', 'cuneus', 'pericalcarine', 'lingual',
+    ],
+    'cingulate': [
+        'rostralanteriorcingulate', 'caudalanteriorcingulate',
+        'posteriorcingulate', 'isthmuscingulate',
+    ],
+    'insular': ['insula'],
+    'language': sorted(LANGUAGE_REGIONS),
+    'auditory': ['transversetemporal', 'superiortemporal'],
+    'brocas': ['parsopercularis', 'parstriangularis'],
+    'wernickes': ['superiortemporal', 'middletemporal', 'supramarginal'],
+}
+
+EXPECTED_CORTEX_VERTICES = 81126
+
+
+class LeBel2023FreeSurferLabels(BaseDataset):
+    """
+    Downloads FreeSurfer parcellation files (aparc.annot, cortex.label)
+    for subjects in the LeBel et al. (2023) dataset (OpenNeuro ds003020).
+    """
+
+    S3_BASE = ("s3://openneuro.org/ds003020/"
+               "derivative/freesurfer_subjdir/")
+    NEEDED_FILES = [
+        'lh.aparc.annot', 'rh.aparc.annot',
+        'lh.cortex.label', 'rh.cortex.label',
+    ]
+
+    def __init__(self, root_dir: Optional[str] = None):
+        super().__init__(root_dir)
+        self.dataset_dir = os.path.join(self.root_dir, "ds003020")
+
+    def _label_dir(self, subject: str) -> str:
+        return os.path.join(
+            self.dataset_dir, "derivative",
+            "freesurfer_subjdir", subject, "label")
+
+    def ensure_downloaded(self, subject: str) -> str:
+        """Download FreeSurfer label files for *subject* if needed.
+
+        Returns the local label directory path.
+        """
+        label_dir = self._label_dir(subject)
+        os.makedirs(label_dir, exist_ok=True)
+
+        for fname in self.NEEDED_FILES:
+            local_path = os.path.join(label_dir, fname)
+            if os.path.exists(local_path):
+                continue
+            s3_path = (f"{self.S3_BASE}{subject}/label/{fname}")
+            print(f"Downloading {s3_path} ...")
+            self.fetch(
+                source=s3_path,
+                target_dir=label_dir,
+                filename=fname,
+                method="s3",
+                anonymous=True,
+            )
+        return label_dir
+
+    def __len__(self):
+        return 0
+
+    def __getitem__(self, idx):
+        return None
+
+
+class RegionMapper:
+    """Maps the 81,126 cortex-surface voxel indices used in LeBel2023
+    HDF5 files to Desikan-Killiany brain regions via FreeSurfer
+    ``aparc.annot`` and ``cortex.label`` files.
+    """
+
+    def __init__(self, label_dir: str):
+        import nibabel.freesurfer as fs
+
+        # --- load cortex masks (vertex indices that are cortex) ---
+        lh_cortex_verts = fs.read_label(
+            os.path.join(label_dir, 'lh.cortex.label'))
+        rh_cortex_verts = fs.read_label(
+            os.path.join(label_dir, 'rh.cortex.label'))
+
+        # --- load aparc annotations (full-hemisphere arrays) ---
+        lh_labels, lh_ctab, lh_names = fs.read_annot(
+            os.path.join(label_dir, 'lh.aparc.annot'))
+        rh_labels, rh_ctab, rh_names = fs.read_annot(
+            os.path.join(label_dir, 'rh.aparc.annot'))
+
+        # Decode bytes → str for region names
+        lh_names = [n.decode() if isinstance(n, bytes) else n
+                    for n in lh_names]
+        rh_names = [n.decode() if isinstance(n, bytes) else n
+                    for n in rh_names]
+
+        # --- build cortex-only region arrays ---
+        lh_cortex_verts = np.sort(lh_cortex_verts)
+        rh_cortex_verts = np.sort(rh_cortex_verts)
+
+        n_cortex = len(lh_cortex_verts) + len(rh_cortex_verts)
+        if n_cortex != EXPECTED_CORTEX_VERTICES:
+            logger.warning(
+                "Cortex vertex count %d differs from expected %d. "
+                "Region mapping may be approximate.",
+                n_cortex, EXPECTED_CORTEX_VERTICES)
+
+        # Region label per cortex vertex (combined LH + RH)
+        lh_region_ids = lh_labels[lh_cortex_verts]
+        rh_region_ids = rh_labels[rh_cortex_verts]
+
+        # Build name arrays — index into names list
+        self.n_cortex = n_cortex
+        self.region_names: List[str] = []  # one per cortex vertex
+        self.hemi_labels: List[str] = []   # 'lh' or 'rh' per vertex
+
+        for rid in lh_region_ids:
+            name = lh_names[rid] if 0 <= rid < len(lh_names) else 'unknown'
+            self.region_names.append(name)
+            self.hemi_labels.append('lh')
+        for rid in rh_region_ids:
+            name = rh_names[rid] if 0 <= rid < len(rh_names) else 'unknown'
+            self.region_names.append(name)
+            self.hemi_labels.append('rh')
+
+        self.region_names = np.array(self.region_names)
+        self.hemi_labels = np.array(self.hemi_labels)
+
+        # Pre-compute unique region set (excluding 'unknown' and
+        # 'corpuscallosum' which shouldn't appear in cortex)
+        self.unique_regions = sorted(set(
+            r for r in self.region_names
+            if r not in ('unknown', 'corpuscallosum')))
+
+        # Build non_language group dynamically
+        all_dk = set(self.unique_regions)
+        REGION_GROUPS['non_language'] = sorted(
+            all_dk - LANGUAGE_REGIONS)
+
+    # ------------------------------------------------------------------
+    # Lookup helpers
+    # ------------------------------------------------------------------
+
+    def get_region_indices(self, region_name: str) -> np.ndarray:
+        """Return cortex-voxel indices for a single DK region
+        (both hemispheres combined)."""
+        return np.where(self.region_names == region_name)[0]
+
+    def get_hemi_region_indices(
+        self, hemi: str, region_name: str
+    ) -> np.ndarray:
+        """Return cortex-voxel indices for one hemisphere + region."""
+        return np.where(
+            (self.region_names == region_name) &
+            (self.hemi_labels == hemi)
+        )[0]
+
+    def get_group_indices(self, group_name: str) -> np.ndarray:
+        """Return cortex-voxel indices for a region group."""
+        regions = REGION_GROUPS.get(group_name, [])
+        mask = np.isin(self.region_names, regions)
+        return np.where(mask)[0]
+
+    def get_language_indices(self) -> np.ndarray:
+        return self.get_group_indices('language')
+
+    def get_non_language_indices(self) -> np.ndarray:
+        return self.get_group_indices('non_language')
+
+    # ------------------------------------------------------------------
+    # Aggregation
+    # ------------------------------------------------------------------
+
+    def aggregate_scores(
+        self,
+        per_voxel_pearson: np.ndarray,
+        per_voxel_r2: np.ndarray,
+    ) -> dict:
+        """Aggregate per-voxel scores into region / group summaries.
+
+        Args:
+            per_voxel_pearson: (n_voxels,) median Pearson r per voxel
+            per_voxel_r2: (n_voxels,) median R² per voxel
+
+        Returns:
+            dict with 'per_region', 'per_group', 'per_hemi_region' keys
+        """
+        n_voxels = len(per_voxel_pearson)
+
+        # Handle potential mismatch between mapping and actual voxel count
+        if n_voxels != self.n_cortex:
+            logger.warning(
+                "Voxel count (%d) != cortex mapping size (%d). "
+                "Truncating to min.",
+                n_voxels, self.n_cortex)
+            limit = min(n_voxels, self.n_cortex)
+            per_voxel_pearson = per_voxel_pearson[:limit]
+            per_voxel_r2 = per_voxel_r2[:limit]
+            region_names = self.region_names[:limit]
+            hemi_labels = self.hemi_labels[:limit]
+        else:
+            region_names = self.region_names
+            hemi_labels = self.hemi_labels
+
+        def _agg(indices):
+            if len(indices) == 0:
+                return {'mean_pearson': 0.0, 'mean_r2': 0.0,
+                        'n_voxels': 0}
+            return {
+                'mean_pearson': float(np.mean(
+                    per_voxel_pearson[indices])),
+                'mean_r2': float(np.mean(per_voxel_r2[indices])),
+                'n_voxels': int(len(indices)),
+            }
+
+        # Per individual region (both hemispheres)
+        per_region = {}
+        for rname in self.unique_regions:
+            idx = np.where(region_names == rname)[0]
+            per_region[rname] = _agg(idx)
+
+        # Per region group
+        per_group = {}
+        for gname, gregions in REGION_GROUPS.items():
+            idx = np.where(np.isin(region_names, gregions))[0]
+            per_group[gname] = _agg(idx)
+
+        # Per hemisphere × region
+        per_hemi_region = {}
+        for hemi in ('lh', 'rh'):
+            hemi_mask = hemi_labels == hemi
+            for rname in self.unique_regions:
+                idx = np.where(
+                    hemi_mask & (region_names == rname))[0]
+                if len(idx) > 0:
+                    per_hemi_region[f'{hemi}_{rname}'] = _agg(idx)
+
+        return {
+            'per_region': per_region,
+            'per_group': per_group,
+            'per_hemi_region': per_hemi_region,
+        }
+
+    def aggregate_rsa_scores(
+        self,
+        per_story_features: list,
+        per_story_fmri: list,
+    ) -> dict:
+        """Compute within-story temporal RSA restricted to region groups.
+
+        Args:
+            per_story_features: list of (n_TRs, D) model feature arrays
+            per_story_fmri: list of (n_TRs, n_voxels) fMRI arrays
+
+        Returns:
+            dict with per_group RSA scores
+        """
+        from scipy.spatial.distance import pdist
+        from scipy.stats import spearmanr
+
+        target_groups = [
+            'language', 'non_language', 'temporal', 'frontal',
+            'parietal', 'occipital', 'auditory', 'brocas', 'wernickes',
+        ]
+        group_stories: Dict[str, list] = {g: [] for g in target_groups}
+
+        for story_feat, story_fmri in zip(
+                per_story_features, per_story_fmri):
+            n_trs = story_feat.shape[0]
+            if n_trs < 3:
+                continue
+            model_rdm = pdist(story_feat, metric='correlation')
+
+            for gname in target_groups:
+                idx = self.get_group_indices(gname)
+                n_voxels = story_fmri.shape[1]
+                idx = idx[idx < n_voxels]
+                if len(idx) == 0:
+                    continue
+                neural_rdm = pdist(
+                    story_fmri[:, idx], metric='correlation')
+                valid = ~(np.isnan(model_rdm) | np.isnan(neural_rdm))
+                if valid.sum() < 3:
+                    continue
+                rho, _ = spearmanr(
+                    model_rdm[valid], neural_rdm[valid])
+                group_stories[gname].append(rho)
+
+        per_group = {}
+        for gname in target_groups:
+            scores = group_stories[gname]
+            per_group[gname] = {
+                'mean_rsa': (float(np.mean(scores))
+                             if scores else 0.0),
+                'n_stories': len(scores),
+            }
+        return {'per_group': per_group}

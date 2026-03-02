@@ -12,7 +12,10 @@ from sklearn.model_selection import GroupKFold
 from sklearn.linear_model import RidgeCV
 from sklearn.metrics import r2_score
 
-from data.LeBel2023 import LeBel2023TRStimulusSet, LeBel2023TRAssembly
+from data.LeBel2023 import (
+    LeBel2023TRStimulusSet, LeBel2023TRAssembly,
+    LeBel2023FreeSurferLabels, RegionMapper,
+)
 from metrics import METRICS
 from metrics.utils import pearson_correlation_scorer
 from models import get_model_class_and_id
@@ -361,6 +364,7 @@ class LeBel2023TRBenchmark:
 
         results = {}
         lang_mask = None
+        region_mapper = None
 
         # 5. Ridge regression (produces language mask)
         if run_ridge:
@@ -422,6 +426,58 @@ class LeBel2023TRBenchmark:
                     f", R2="
                     f"{results[ridge_key]['final_r2_lang']:.4f}")
 
+            # --- Region-based scoring ---
+            try:
+                fs_labels = LeBel2023FreeSurferLabels()
+                label_dir = fs_labels.ensure_downloaded(
+                    self.subject_id)
+                region_mapper = RegionMapper(label_dir)
+
+                median_r2 = np.median(
+                    fold_scores['r2'], axis=0)
+                region_scores = region_mapper.aggregate_scores(
+                    median_pearson, median_r2)
+                results[ridge_key]['regions'] = region_scores
+
+                # Anatomical language mask (replaces functional)
+                anat_lang_idx = region_mapper.get_language_indices()
+                n_voxels = y.shape[1]
+                anat_lang_mask = np.zeros(n_voxels, dtype=bool)
+                valid_idx = anat_lang_idx[
+                    anat_lang_idx < n_voxels]
+                anat_lang_mask[valid_idx] = True
+
+                # Keep old functional mask for backward compat
+                results[ridge_key]['lang_mask_functional'] = lang_mask
+                # Replace default with anatomical
+                lang_mask = anat_lang_mask
+                results[ridge_key]['lang_mask'] = lang_mask
+                n_lang_voxels = int(np.sum(lang_mask))
+                results[ridge_key]['n_lang_voxels'] = n_lang_voxels
+                results[ridge_key]['median_pearson_lang'] = (
+                    median_pearson[lang_mask]
+                    if n_lang_voxels > 0 else np.array([]))
+                results[ridge_key]['final_pearson_lang'] = (
+                    float(np.mean(median_pearson[lang_mask]))
+                    if n_lang_voxels > 0 else 0.0)
+                results[ridge_key]['median_r2_lang'] = (
+                    median_r2[lang_mask]
+                    if n_lang_voxels > 0 else np.array([]))
+                results[ridge_key]['final_r2_lang'] = (
+                    float(np.mean(median_r2[lang_mask]))
+                    if n_lang_voxels > 0 else 0.0)
+
+                lang_grp = region_scores['per_group'].get(
+                    'language', {})
+                print(
+                    f"Region scoring: language group "
+                    f"Pearson="
+                    f"{lang_grp.get('mean_pearson', 0):.4f}, "
+                    f"non-language="
+                    f"{region_scores['per_group'].get('non_language', {}).get('mean_pearson', 0):.4f}")
+            except Exception as e:
+                print(f"Warning: Region-based scoring failed: {e}")
+
         # 6. Within-story temporal RSA
         if run_temporal_rsa:
             print("Computing within-story temporal RSA...")
@@ -436,6 +492,26 @@ class LeBel2023TRBenchmark:
                 print(f"Temporal RSA - "
                       f"Mean (lang voxels): "
                       f"{rsa_results['mean_rsa_lang']:.4f}")
+
+            # --- Region-based temporal RSA ---
+            try:
+                if region_mapper is None:
+                    fs_labels = LeBel2023FreeSurferLabels()
+                    label_dir = fs_labels.ensure_downloaded(
+                        self.subject_id)
+                    region_mapper = RegionMapper(label_dir)
+                rsa_region_scores = region_mapper.aggregate_rsa_scores(
+                    all_features, all_fmri)
+                results['temporal_rsa']['regions'] = rsa_region_scores
+                lang_rsa = rsa_region_scores['per_group'].get(
+                    'language', {})
+                print(
+                    f"Region RSA: language="
+                    f"{lang_rsa.get('mean_rsa', 0):.4f}, "
+                    f"non-language="
+                    f"{rsa_region_scores['per_group'].get('non_language', {}).get('mean_rsa', 0):.4f}")
+            except Exception as e:
+                print(f"Warning: Region-based RSA failed: {e}")
 
         results['timestamp'] = datetime.datetime.utcnow().isoformat()
         results['hrf_delay'] = self.hrf_delay
