@@ -301,7 +301,8 @@ class LeBel2023Assembly(BaseDataset):
                   f"mean={np.mean(ceiling):.4f}")
             return ceiling
         else:
-            print(f"Warning: No ceiling for {subj}, using placeholder ceiling=1.0")
+            print(
+                f"Warning: No ceiling for {subj}, using placeholder ceiling=1.0")
             return np.ones(n_voxels, dtype=np.float32)
 
     def __len__(self):
