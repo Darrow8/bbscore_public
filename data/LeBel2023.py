@@ -733,6 +733,12 @@ class LeBel2023AudioStimulusSet(BaseDataset):
 
         wav_files = sorted(
             glob.glob(os.path.join(self.stimuli_dir, "*.wav")))
+        # Filter out non-story stimuli (e.g., localizer scans) that have
+        # no corresponding fMRI data in the assembly (84 stories)
+        _NON_STORY = {'auditory_localizer'}
+        wav_files = [f for f in wav_files
+                     if os.path.basename(f).replace('.wav', '')
+                     not in _NON_STORY]
         print(f"Found {len(wav_files)} audio stimulus files.")
         if not wav_files:
             raise FileNotFoundError(
@@ -806,6 +812,12 @@ class LeBel2023AudioTRStimulusSet(BaseDataset):
 
         wav_files = sorted(
             glob.glob(os.path.join(self.stimuli_dir, "*.wav")))
+        # Filter out non-story stimuli (e.g., localizer scans) that have
+        # no corresponding fMRI data in the assembly (84 stories)
+        _NON_STORY = {'auditory_localizer'}
+        wav_files = [f for f in wav_files
+                     if os.path.basename(f).replace('.wav', '')
+                     not in _NON_STORY]
         print(f"Found {len(wav_files)} audio stimulus files.")
         if not wav_files:
             raise FileNotFoundError(
